@@ -3,9 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#241B2E" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Bookings" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="icon" type="image/png" href="icon-192.png" />
 <title>Hall Bookings</title>
 <style>
   :root{
@@ -122,6 +127,27 @@
   .toast.type-cancel{ background:var(--rose); }
   .toast.type-restore{ background:var(--green); }
   @keyframes toastin{ from{ opacity:0; transform:translateY(-8px); } to{ opacity:1; transform:translateY(0); } }
+
+  /* ---- installable app + offline additions ---- */
+  header.topbar{ padding-top:calc(22px + env(safe-area-inset-top)); }
+  #app{ padding-bottom:calc(96px + env(safe-area-inset-bottom)); }
+  .fab{ bottom:calc(26px + env(safe-area-inset-bottom)); }
+  .install-banner{ background:var(--ink); color:#fff; font-size:13px; line-height:1.4; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; padding-top:calc(10px + env(safe-area-inset-top)); }
+  .install-banner b{ font-weight:600; }
+  .ib-actions{ display:flex; align-items:center; gap:6px; flex-shrink:0; }
+  .ib-main{ background:var(--gold); color:var(--gold-ink); border:none; border-radius:8px; padding:8px 12px; font-size:12.5px; font-weight:600; font-family:inherit; cursor:pointer; white-space:nowrap; }
+  .ib-x{ background:none; border:none; color:#fff; font-size:22px; line-height:1; cursor:pointer; padding:0 4px; opacity:.8; }
+  .install-banner + header.topbar{ padding-top:14px; }
+  .issues{ padding:12px 20px 0; display:flex; flex-direction:column; gap:8px; }
+  .issue{ background:var(--rose-bg); color:var(--rose); font-size:12.5px; line-height:1.45; padding:10px 12px; border-radius:10px; display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+  .issue button{ background:none; border:1px solid var(--rose); color:var(--rose); border-radius:7px; padding:4px 8px; font-size:11.5px; font-family:inherit; cursor:pointer; flex-shrink:0; }
+  .setup{ padding:calc(48px + env(safe-area-inset-top)) 24px 40px; }
+  .setup h1.display{ font-size:28px; margin:0 0 6px; }
+  .setup-lead{ color:var(--ink-soft); font-size:14.5px; margin:0 0 22px; }
+  .setup-btn{ width:100%; flex:none; display:block; }
+  .setup-or{ text-align:center; color:var(--muted); font-size:12.5px; margin:20px 0 12px; }
+  .setup-note{ color:var(--muted); font-size:12px; line-height:1.5; margin-top:18px; }
+  .linkbtn{ background:none !important; color:var(--ink-soft) !important; text-decoration:underline; padding:6px !important; margin-top:4px !important; }
 </style>
 </head>
 <body>
@@ -129,15 +155,26 @@
 
 <script>
 (function(){
+  "use strict";
 
   const CURRENCY = "\u20B9";
   const SLOT_LABEL = { full:"Full day", day:"Day", evening:"Evening" };
   const JSONBIN_BASE = "https://api.jsonbin.io/v3/b";
   const JSONBIN_KEY = "$2a$10$4fnLyv7pb7d0ChZN7aWVT.d0cHew83jv3FU6s9Gqg9P3QVDS0uEaC";
 
+  const LAST_DOC_KEY = "hb_last_doc";
+  const NAME_KEY = "hb_my_name";
+  const IOS_HINT_KEY = "hb_ios_hint_dismissed";
+  const cacheKey  = id => "hb_cache_"  + id;   // last bookings list seen from the server
+  const queueKey  = id => "hb_queue_"  + id;   // changes made on this phone not yet synced
+  const issuesKey = id => "hb_issues_" + id;   // changes that could not be synced (date taken)
+  const seenKey   = id => "hb_seen_v2_" + id;  // for "new/cancelled booking" alerts
+
   let state = {
     docId: "",
-    bookings: [],
+    remote: [],          // last list received from the server
+    queue: [],           // pending local changes
+    bookings: [],        // what the screen shows = remote + pending changes
     tab: "upcoming",
     search: "",
     myName: "",
@@ -147,15 +184,35 @@
     conflict: null,
     saving: false,
     saveError: "",
-    syncStatus: "loading",
+    syncStatus: "loading",   // loading | ok | offline | error
     bootError: "",
     bootErrorTech: "",
+    needsSetup: false,
+    setupText: "",
+    setupError: "",
+    setupBusy: false,
     justShared: false,
     calMonth: null,
     dayDetail: null,
-    toasts: []
+    toasts: [],
+    issues: [],
+    installEvt: null,
+    installDismissed: false,
+    showIosHint: false,
+    installed: false
   };
   let toastCounter = 0;
+  let booted = false;
+  let loopsStarted = false;
+  let flushing = false;
+  let refreshing = false;
+  let lastSig = "";
+
+  // ---------- small helpers ----------
+
+  function lsGet(k, fb){ try{ const raw = localStorage.getItem(k); return raw === null ? fb : JSON.parse(raw); }catch(e){ return fb; } }
+  function lsSet(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+  function lsHas(k){ try{ return localStorage.getItem(k) !== null; }catch(e){ return false; } }
 
   function pad2(n){ return String(n).padStart(2,"0"); }
   function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
@@ -167,6 +224,14 @@
   function daysInMonth(d){ return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate(); }
   function isoOf(y,m,day){ return `${y}-${pad2(m+1)}-${pad2(day)}`; }
   function monthLabel(d){ return d.toLocaleDateString(undefined,{month:"long",year:"numeric"}); }
+  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+  function escapeAttr(s){ return escapeHtml(s==null?"":s); }
+  function withTimeout(p, ms){
+    return new Promise((resolve,reject)=>{
+      const t = setTimeout(()=>reject(new Error("timeout")), ms);
+      p.then(v=>{ clearTimeout(t); resolve(v); }, e=>{ clearTimeout(t); reject(e); });
+    });
+  }
 
   function statusOf(b){
     if (b.cancelled) return "cancelled";
@@ -187,9 +252,7 @@
   function findConflict(date,slot,excludeId){
     return state.bookings.find(b=> b.id!==excludeId && !b.cancelled && b.date===date && slotsOverlap(b.slot,slot)) || null;
   }
-  function activeBookingsOn(dateStr){
-    return state.bookings.filter(b=>!b.cancelled && b.date===dateStr);
-  }
+  function activeBookingsOn(dateStr){ return state.bookings.filter(b=>!b.cancelled && b.date===dateStr); }
   function dayFillClass(dateStr){
     const list = activeBookingsOn(dateStr);
     if (list.length===0) return "cal-empty";
@@ -201,7 +264,28 @@
     return "cal-empty";
   }
 
-  // ---------- change alerts (in-app toasts + best-effort OS notifications) ----------
+  // ---------- local copy + offline queue ----------
+
+  function applyOps(list, queue){
+    let out = list.slice();
+    queue.forEach(op=>{
+      if (op.type === "upsert"){
+        const i = out.findIndex(b=>b.id===op.booking.id);
+        if (i>=0) out[i] = op.booking; else out.push(op.booking);
+      } else if (op.type === "delete"){
+        out = out.filter(b=>b.id!==op.id);
+      }
+    });
+    return out;
+  }
+  function recompute(){ state.bookings = applyOps(state.remote, state.queue); }
+  function persistLocal(){
+    if (!state.docId) return;
+    lsSet(cacheKey(state.docId), state.remote);
+    lsSet(queueKey(state.docId), state.queue);
+  }
+
+  // ---------- change alerts (in-app banners + optional phone notifications) ----------
 
   function pushToast(text, type){
     const id = "t" + (++toastCounter);
@@ -209,10 +293,10 @@
     render();
     setTimeout(()=>{
       state.toasts = state.toasts.filter(t=>t.id!==id);
-      render();
+      const el = document.querySelector('[data-toast="'+id+'"]');
+      if (el) el.remove();
     }, 6000);
   }
-
   function notifyOS(title, body){
     try{
       if (typeof Notification!=="undefined" && Notification.permission==="granted"){
@@ -220,24 +304,12 @@
       }
     }catch(e){}
   }
-
   function snapshotFromBookings(list){
     const map = {};
     list.forEach(b=>{ map[b.id] = !!b.cancelled; });
     return map;
   }
-
-  function loadSeenSnapshot(){
-    try{
-      const raw = localStorage.getItem("hb_seen_v1");
-      return raw ? JSON.parse(raw) : null;
-    }catch(e){ return null; }
-  }
-
-  function saveSeenSnapshot(map){
-    try{ localStorage.setItem("hb_seen_v1", JSON.stringify(map)); }catch(e){}
-  }
-
+  function saveSeen(){ if (state.docId) lsSet(seenKey(state.docId), snapshotFromBookings(state.bookings)); }
   function diffAndAnnounce(prevMap, newList){
     if (!prevMap) return;
     newList.forEach(b=>{
@@ -245,29 +317,47 @@
       if (!had){
         if (!b.cancelled){
           const text = "New booking: " + (b.customer||"Someone") + " — " + fmtDate(b.date);
-          pushToast(text, "new");
-          notifyOS("New booking", text);
+          pushToast(text, "new"); notifyOS("New booking", text);
         }
       } else {
         const wasCancelled = prevMap[b.id];
         if (!wasCancelled && b.cancelled){
           const text = "Cancelled: " + (b.customer||"Someone") + " — " + fmtDate(b.date);
-          pushToast(text, "cancel");
-          notifyOS("Booking cancelled", text);
+          pushToast(text, "cancel"); notifyOS("Booking cancelled", text);
         } else if (wasCancelled && !b.cancelled){
           const text = "Restored: " + (b.customer||"Someone") + " — " + fmtDate(b.date);
-          pushToast(text, "restore");
-          notifyOS("Booking restored", text);
+          pushToast(text, "restore"); notifyOS("Booking restored", text);
         }
       }
     });
+  }
+  function addIssue(text){
+    state.issues.push({ id: "i" + Date.now() + Math.random().toString(36).slice(2,5), text });
+    lsSet(issuesKey(state.docId), state.issues);
+    pushToast(text, "cancel");
   }
 
   // ---------- shared storage over the internet (jsonbin.io) ----------
 
   function getDocIdFromUrl(){
-    const params = new URLSearchParams(window.location.search);
-    return (params.get("doc")||"").trim();
+    const p = new URLSearchParams(window.location.search);
+    return (p.get("doc")||"").trim();
+  }
+  function resolveDocId(){ return getDocIdFromUrl() || lsGet(LAST_DOC_KEY, "") || ""; }
+  function parseDocInput(text){
+    const t = (text||"").trim();
+    if (!t) return "";
+    try{ const u = new URL(t); const d = u.searchParams.get("doc"); if (d) return d.trim(); }catch(e){}
+    const m = t.match(/[?&]doc=([^&#\s]+)/);
+    if (m) return decodeURIComponent(m[1]);
+    return t;
+  }
+
+  function netError(e){
+    const err = new Error("No internet connection");
+    err.offline = true;
+    err.cause = e;
+    return err;
   }
 
   async function createDoc(){
@@ -278,9 +368,7 @@
         headers:{ "Content-Type":"application/json", "X-Master-Key": JSONBIN_KEY },
         body: JSON.stringify({ bookings: [] })
       });
-    }catch(e){
-      throw new Error("Network request blocked or failed ("+(e && e.message ? e.message : "unknown")+")");
-    }
+    }catch(e){ throw netError(e); }
     if (!res.ok){
       let detail = "";
       try{ const j = await res.json(); detail = j && j.message ? " — "+j.message : ""; }catch(e){}
@@ -293,81 +381,171 @@
     return id;
   }
 
-  async function ensureDoc(){
-    let id = getDocIdFromUrl();
-    if (id) return id;
-    id = await createDoc();
-    const url = new URL(window.location.href);
-    url.searchParams.set("doc", id);
-    window.history.replaceState({}, "", url.toString());
-    state.justShared = true;
-    return id;
-  }
-
-  async function loadBookings(){
+  async function loadBookings(id){
+    const docId = id || state.docId;
     let res;
     try{
-      res = await fetch(`${JSONBIN_BASE}/${state.docId}/latest`, {
+      res = await fetch(`${JSONBIN_BASE}/${encodeURIComponent(docId)}/latest`, {
         headers:{ "X-Master-Key": JSONBIN_KEY, "X-Bin-Meta":"false" },
         cache:"no-store"
       });
-    }catch(e){
-      throw new Error("Network request blocked or failed ("+(e && e.message ? e.message : "unknown")+")");
+    }catch(e){ throw netError(e); }
+    if (res.status === 404 || res.status === 422){
+      const err = new Error("Booking link not found"); err.notFound = true; throw err;
     }
-    if (res.status === 404) return [];
     if (!res.ok) throw new Error("Sync failed (HTTP "+res.status+")");
     let data;
-    try{ data = await res.json(); }catch(e){ return []; }
+    try{ data = await res.json(); }catch(e){ throw new Error("Unexpected response from server"); }
     return (data && Array.isArray(data.bookings)) ? data.bookings : [];
   }
 
   async function saveBookingsRemote(arr){
     let res;
     try{
-      res = await fetch(`${JSONBIN_BASE}/${state.docId}`, {
+      res = await fetch(`${JSONBIN_BASE}/${encodeURIComponent(state.docId)}`, {
         method:"PUT",
         headers:{ "Content-Type":"application/json", "X-Master-Key": JSONBIN_KEY },
         body: JSON.stringify({ bookings: arr })
       });
-    }catch(e){
-      throw new Error("Network request blocked or failed ("+(e && e.message ? e.message : "unknown")+")");
-    }
+    }catch(e){ throw netError(e); }
     if (!res.ok) throw new Error("Save failed (HTTP "+res.status+")");
   }
 
-  async function refresh(){
-    if (state.openSheet) return;
-    state.syncStatus = "busy"; render();
+  // Send pending changes to the server. Returns true when nothing is left waiting.
+  async function flushQueue(){
+    if (flushing) return false;
+    if (!state.queue.length) return true;
+    flushing = true;
     try{
-      state.bookings = await loadBookings();
-      const prevMap = loadSeenSnapshot();
-      diffAndAnnounce(prevMap, state.bookings);
-      saveSeenSnapshot(snapshotFromBookings(state.bookings));
+      const latest = await loadBookings();
+      let merged = latest.slice();
+      const sent = state.queue.slice();
+      const rejected = [];
+      sent.forEach(op=>{
+        if (op.type === "upsert"){
+          const b = op.booking;
+          if (!b.cancelled){
+            const clash = merged.find(x=>x.id!==b.id && !x.cancelled && x.date===b.date && slotsOverlap(x.slot,b.slot));
+            if (clash){ rejected.push({ booking:b, clash }); return; }
+          }
+          const i = merged.findIndex(x=>x.id===b.id);
+          if (i>=0) merged[i] = b; else merged.push(b);
+        } else if (op.type === "delete"){
+          merged = merged.filter(x=>x.id!==op.id);
+        }
+      });
+      await saveBookingsRemote(merged);
+      state.remote = merged;
+      state.queue = state.queue.filter(op=>!sent.includes(op));
+      persistLocal();
+      recompute();
+      saveSeen();
+      rejected.forEach(r=>{
+        addIssue("Couldn't sync \u201C" + (r.booking.customer||"a booking") + "\u201D on " + fmtDate(r.booking.date) +
+          " — that date was already taken by " + (r.clash.customer||"another booking") + ". Please enter it again for a free date.");
+      });
+      return state.queue.length === 0;
+    }catch(e){
+      return false;
+    }finally{
+      flushing = false;
+    }
+  }
+
+  async function tryPullRemote(){
+    try{
+      const latest = await withTimeout(loadBookings(), 3500);
+      state.remote = latest;
+      persistLocal();
+      recompute();
+      return true;
+    }catch(e){ return false; }
+  }
+
+  function sig(){ return JSON.stringify([state.bookings, state.syncStatus, state.queue.length, state.issues.length]); }
+
+  async function refresh(){
+    if (state.openSheet || !state.docId || state.needsSetup || state.bootError) return;
+    if (refreshing) return;
+    refreshing = true;
+    try{
+      if (state.queue.length) await flushQueue();
+      const latest = await loadBookings();
+      state.remote = latest;
+      persistLocal();
+      recompute();
+      diffAndAnnounce(lsGet(seenKey(state.docId), null), state.bookings);
+      saveSeen();
       state.syncStatus = "ok";
     }catch(e){
-      state.syncStatus = "error";
+      state.syncStatus = ((e && e.offline) || !navigator.onLine) ? "offline" : "error";
+    }finally{
+      refreshing = false;
     }
-    render();
+    const s = sig();
+    if (s !== lastSig){ lastSig = s; render(); }
+  }
+
+  // ---------- install to home screen ----------
+
+  function setupInstall(){
+    const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || window.navigator.standalone === true;
+    state.installed = standalone;
+    window.addEventListener("beforeinstallprompt", (e)=>{
+      e.preventDefault();
+      state.installEvt = e;
+      if (!state.openSheet) render();
+    });
+    window.addEventListener("appinstalled", ()=>{
+      state.installEvt = null; state.installed = true;
+      if (!state.openSheet) render();
+    });
+    const ua = navigator.userAgent || "";
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    if (isIOS && !standalone && !lsGet(IOS_HINT_KEY, false)) state.showIosHint = true;
+  }
+
+  // Makes the installed app open straight into your team's bookings.
+  function updateManifestLink(){
+    try{
+      if (!/^https?:$/.test(location.protocol)) return;
+      const base = location.origin + location.pathname.replace(/[^/]*$/, "");
+      const m = {
+        name: "Hall Bookings", short_name: "Bookings",
+        id: base, start_url: base + "?doc=" + encodeURIComponent(state.docId), scope: base,
+        display: "standalone", orientation: "portrait",
+        background_color: "#FAF6F0", theme_color: "#241B2E",
+        icons: [
+          { src: base+"icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: base+"icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+          { src: base+"icon-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
+        ]
+      };
+      const blob = new Blob([JSON.stringify(m)], { type: "application/manifest+json" });
+      let link = document.querySelector('link[rel="manifest"]');
+      if (!link){ link = document.createElement("link"); link.rel = "manifest"; document.head.appendChild(link); }
+      link.href = URL.createObjectURL(blob);
+    }catch(e){}
+  }
+
+  function registerSW(){
+    if (!("serviceWorker" in navigator)) return;
+    if (!(location.protocol === "https:" || location.hostname === "localhost")) return;
+    const go = ()=>{ navigator.serviceWorker.register("sw.js").catch(()=>{}); };
+    if (document.readyState === "complete") go(); else window.addEventListener("load", go);
   }
 
   // ---------- rendering ----------
 
   function render(){
     const app = document.getElementById("app");
-    if (state.bootError){
-      app.innerHTML = `
-        <div class="errbox">
-          Couldn't connect to shared storage.<br/>${escapeHtml(state.bootError)}<br/>
-          Check your internet connection and try again.
-          <div class="tech">${escapeHtml(state.bootErrorTech||"")}</div>
-          <br/><button id="retryBoot">Try again</button>
-        </div>`;
-      document.getElementById("retryBoot").addEventListener("click", boot);
-      return;
-    }
+    if (state.needsSetup){ app.innerHTML = renderSetup(); bindSetup(); return; }
+    if (state.bootError){ app.innerHTML = renderBootError(); bindBootError(); return; }
     app.innerHTML = `
       ${renderToasts()}
+      ${renderInstallBanner()}
       ${renderTopbar()}
+      ${renderIssues()}
       ${state.tab!=='calendar' ? renderSearch() : ""}
       <main>${state.tab==='calendar' ? renderCalendar() : renderList()}</main>
       <button class="fab" id="fabAdd" title="New booking"><span class="fab-plus">+</span> Add New Booking</button>
@@ -377,12 +555,109 @@
     attachHandlers();
   }
 
-  function shareUrl(){ return window.location.href; }
+  function renderSetup(){
+    return `
+      <div class="setup">
+        <h1 class="display">Hall Bookings</h1>
+        <p class="setup-lead">Connect this phone to your team's bookings.</p>
+        <div class="field">
+          <label for="setupInput">Paste your team link or booking ID</label>
+          <input id="setupInput" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://…/?doc=…" value="${escapeAttr(state.setupText)}" />
+        </div>
+        ${state.setupError ? `<div class="saveerr">${escapeHtml(state.setupError)}</div>` : ""}
+        <button class="primary setup-btn" id="setupConnect" ${state.setupBusy?"disabled":""}>${state.setupBusy?"Connecting...":"Connect"}</button>
+        <div class="setup-or">or, if you are the very first person setting this up</div>
+        <button class="ghost setup-btn" id="setupCreate" ${state.setupBusy?"disabled":""}>Create a new shared bookings space</button>
+        <p class="setup-note">Everyone else on your team should use "Connect" with the same link, so you all see the same bookings.</p>
+      </div>
+    `;
+  }
+
+  function bindSetup(){
+    const input = document.getElementById("setupInput");
+    if (input) input.addEventListener("input", (e)=>{ state.setupText = e.target.value; });
+    const connect = document.getElementById("setupConnect");
+    if (connect) connect.addEventListener("click", async ()=>{
+      const id = parseDocInput(state.setupText);
+      if (!id){ state.setupError = "Paste your team link or booking ID first."; render(); return; }
+      state.setupBusy = true; state.setupError = ""; render();
+      try{
+        const list = await loadBookings(id);
+        state.setupBusy = false;
+        await startWithDoc(id, list);
+      }catch(e){
+        state.setupBusy = false;
+        state.setupError = e.notFound ? "That link or ID wasn't found. Check it and try again."
+          : (e.offline ? "No internet connection. This phone needs to connect once to get set up."
+          : "Couldn't connect (" + (e.message||"unknown error") + ").");
+        render();
+      }
+    });
+    const create = document.getElementById("setupCreate");
+    if (create) create.addEventListener("click", async ()=>{
+      state.setupBusy = true; state.setupError = ""; render();
+      try{
+        const id = await createDoc();
+        state.setupBusy = false;
+        state.justShared = true;
+        await startWithDoc(id, []);
+      }catch(e){
+        state.setupBusy = false;
+        state.setupError = e.offline ? "No internet connection. This phone needs to connect once to get set up."
+          : "Couldn't create it (" + (e.message||"unknown error") + ").";
+        render();
+      }
+    });
+  }
+
+  function renderBootError(){
+    return `
+      <div class="errbox">
+        Couldn't connect to shared storage.<br/>${escapeHtml(state.bootError)}<br/>
+        Check your internet connection and try again.
+        <div class="tech">${escapeHtml(state.bootErrorTech||"")}</div>
+        <br/><button id="retryBoot">Try again</button>
+        <br/><button id="changeLink" class="linkbtn">Use a different team link</button>
+      </div>`;
+  }
+  function bindBootError(){
+    const retry = document.getElementById("retryBoot");
+    if (retry) retry.addEventListener("click", boot);
+    const change = document.getElementById("changeLink");
+    if (change) change.addEventListener("click", ()=>{
+      lsSet(LAST_DOC_KEY, "");
+      try{ const u = new URL(window.location.href); u.searchParams.delete("doc"); window.history.replaceState({}, "", u.toString()); }catch(e){}
+      state.docId = ""; state.bootError = ""; state.needsSetup = true; state.setupError = "";
+      render();
+    });
+  }
 
   function renderToasts(){
     if (!state.toasts.length) return "";
     return `<div class="toast-stack">${state.toasts.map(t=>`<div class="toast type-${t.type}" data-toast="${t.id}">${escapeHtml(t.text)}</div>`).join("")}</div>`;
   }
+
+  function renderInstallBanner(){
+    if (state.installed) return "";
+    if (state.installEvt && !state.installDismissed){
+      return `<div class="install-banner"><span>Install this app on your home screen</span>
+        <div class="ib-actions"><button id="installBtn" class="ib-main">Install app</button><button id="installDismiss" class="ib-x" aria-label="Dismiss">&times;</button></div></div>`;
+    }
+    if (state.showIosHint){
+      return `<div class="install-banner"><span>To install: tap <b>Share</b>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><path d="M12 15V3"/><path d="M8 7l4-4 4 4"/><path d="M5 11v9h14v-9"/></svg>
+        then <b>Add to Home Screen</b></span>
+        <div class="ib-actions"><button id="iosDismiss" class="ib-main">Got it</button></div></div>`;
+    }
+    return "";
+  }
+
+  function renderIssues(){
+    if (!state.issues.length) return "";
+    return `<div class="issues">${state.issues.map(i=>`<div class="issue"><span>${escapeHtml(i.text)}</span><button data-issue="${i.id}">Dismiss</button></div>`).join("")}</div>`;
+  }
+
+  function shareUrl(){ return location.origin + location.pathname + "?doc=" + encodeURIComponent(state.docId); }
 
   function alertsLabel(){
     if (typeof Notification === "undefined") return "Alerts unsupported";
@@ -391,16 +666,32 @@
     return "Enable alerts";
   }
 
+  function statusLine(){
+    const n = state.queue.length;
+    const plural = n === 1 ? "change" : "changes";
+    if (state.syncStatus === "offline"){
+      return n ? `Offline \u2014 ${n} ${plural} saved on this phone, will sync when signal returns`
+               : "Offline \u2014 showing saved bookings. New changes will sync when signal returns";
+    }
+    if (n) return `${n} ${plural} waiting to sync`;
+    if (state.syncStatus === "error") return "Can't reach the server \u2014 retrying";
+    return "Shared with your team \u00B7 updates live over data or Wi-Fi";
+  }
+  function dotClass(){
+    if (state.syncStatus === "offline" || state.syncStatus === "error") return "err";
+    if (state.syncStatus === "loading" || state.queue.length) return "busy";
+    return "";
+  }
+
   function renderTopbar(){
-    const dotClass = state.syncStatus==="ok" ? "" : (state.syncStatus==="error" ? "err" : "busy");
     const notifOn = typeof Notification!=="undefined" && Notification.permission==="granted";
     return `
       <header class="topbar">
         <div class="title-row">
-          <h1 class="display"><span class="sync-dot ${dotClass}"></span>Bookings</h1>
+          <h1 class="display"><span class="sync-dot ${dotClass()}"></span>Bookings</h1>
           <button id="enableAlerts" class="alerts-btn ${notifOn?'on':''}">${alertsLabel()}</button>
         </div>
-        <div class="tagline">Shared with your team &middot; ${state.syncStatus==='error' ? 'offline — retrying' : 'updates live over data or Wi-Fi'}</div>
+        <div class="tagline">${statusLine()}</div>
         <div class="share-banner">
           <span>${state.justShared ? "Share this page's link so your team sees the same bookings." : "Everyone must open this exact link (with the same booking id) to stay in sync."}</span>
           <button id="copyLink">Copy link</button>
@@ -445,12 +736,13 @@
     const list = visibleBookings();
     if (list.length===0){
       const msgs = {
-        upcoming:"No upcoming bookings yet. Tap + to add the first one.",
+        upcoming:"No upcoming bookings yet. Tap \u201CAdd New Booking\u201D to add the first one.",
         past:"No past bookings to show.",
         cancelled:"No cancelled bookings."
       };
       return `<div class="empty">${msgs[state.tab]||""}</div>`;
     }
+    const pendingIds = new Set(state.queue.filter(o=>o.type==="upsert").map(o=>o.booking.id));
     return list.map(b=>{
       const s = statusOf(b);
       return `
@@ -466,7 +758,7 @@
           ${b.eventType ? `<div class="row-event">${escapeHtml(b.eventType)}</div>` : ""}
           <div class="row-bottom">
             <span class="pill status-${s}">${statusText(b)}</span>
-            ${b.createdBy ? `<span class="meta">by ${escapeHtml(b.createdBy)}</span>` : ""}
+            ${pendingIds.has(b.id) ? `<span class="meta">waiting to sync</span>` : (b.createdBy ? `<span class="meta">by ${escapeHtml(b.createdBy)}</span>` : "")}
           </div>
         </div>
       `;
@@ -479,7 +771,6 @@
     const startWeekday = new Date(y,mo,1).getDay();
     const totalDays = daysInMonth(m);
     const todayIso = todayStr();
-
     let cells = "";
     for (let i=0;i<startWeekday;i++){ cells += `<div class="cal-cell cal-blank"></div>`; }
     for (let day=1; day<=totalDays; day++){
@@ -488,7 +779,6 @@
       const isToday = dateStr===todayIso ? "cal-today" : "";
       cells += `<div class="cal-cell ${cls} ${isToday}" data-caldate="${dateStr}"><span class="cal-daynum">${day}</span></div>`;
     }
-
     return `
       <div class="cal-header">
         <button class="cal-nav" id="calPrev">&lsaquo;</button>
@@ -579,7 +869,7 @@
           ${state.saveError ? `<div class="saveerr">${escapeHtml(state.saveError)}</div>` : ""}
           <div class="btnrow">
             <button class="ghost" id="cancelForm">Discard</button>
-            <button class="primary" id="saveForm" ${state.conflict?"disabled":""}>${state.saving?"Saving...":(isEdit?"Save changes":"Create booking")}</button>
+            <button class="primary" id="saveForm" ${state.conflict||state.saving?"disabled":""}>${state.saving?"Saving...":(isEdit?"Save changes":"Create booking")}</button>
           </div>
           ${isEdit ? `
             <div class="danger-zone">
@@ -591,35 +881,51 @@
     `;
   }
 
-  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-  function escapeAttr(s){ return escapeHtml(s==null?"":s); }
-
   // ---------- events ----------
 
   function attachHandlers(){
     const app = document.getElementById("app");
 
     const nameInput = document.getElementById("myNameInput");
-    if (nameInput) nameInput.addEventListener("change",(e)=>{ state.myName = e.target.value; });
+    if (nameInput) nameInput.addEventListener("change",(e)=>{ state.myName = e.target.value; lsSet(NAME_KEY, state.myName); });
 
     app.querySelectorAll("[data-toast]").forEach(t=>{
       t.addEventListener("click", ()=>{
         const id = t.getAttribute("data-toast");
         state.toasts = state.toasts.filter(x=>x.id!==id);
+        t.remove();
+      });
+    });
+
+    app.querySelectorAll("[data-issue]").forEach(btn=>{
+      btn.addEventListener("click", ()=>{
+        const id = btn.getAttribute("data-issue");
+        state.issues = state.issues.filter(x=>x.id!==id);
+        lsSet(issuesKey(state.docId), state.issues);
         render();
       });
     });
 
+    const installBtn = document.getElementById("installBtn");
+    if (installBtn) installBtn.addEventListener("click", async ()=>{
+      const evt = state.installEvt;
+      if (!evt) return;
+      state.installEvt = null;
+      try{ evt.prompt(); await evt.userChoice; }catch(e){}
+      render();
+    });
+    const installDismiss = document.getElementById("installDismiss");
+    if (installDismiss) installDismiss.addEventListener("click", ()=>{ state.installDismissed = true; render(); });
+    const iosDismiss = document.getElementById("iosDismiss");
+    if (iosDismiss) iosDismiss.addEventListener("click", ()=>{ state.showIosHint = false; lsSet(IOS_HINT_KEY, true); render(); });
+
     const alertsBtn = document.getElementById("enableAlerts");
     if (alertsBtn) alertsBtn.addEventListener("click", async ()=>{
       if (typeof Notification === "undefined"){
-        alert("This browser doesn't support notifications. You'll still see in-app alerts while this page is open.");
+        alert("This browser doesn't support phone notifications. You'll still see in-app alerts while this page is open.");
         return;
       }
-      if (Notification.permission === "granted"){
-        pushToast("Alerts are already on.", "new");
-        return;
-      }
+      if (Notification.permission === "granted"){ pushToast("Alerts are already on.", "new"); return; }
       if (Notification.permission === "denied"){
         alert("Notifications are blocked for this site. Enable them in your browser/site settings, then reload the page.");
         return;
@@ -627,7 +933,7 @@
       try{
         const result = await Notification.requestPermission();
         render();
-        if (result === "granted") pushToast("Alerts enabled — you'll get notified of new and cancelled bookings while this page is open.", "restore");
+        if (result === "granted") pushToast("Alerts enabled \u2014 you'll get notified of new and cancelled bookings while this page is open.", "restore");
       }catch(e){}
     });
 
@@ -681,10 +987,7 @@
     if (calNext) calNext.addEventListener("click", ()=>{ state.calMonth = addMonths(state.calMonth,1); render(); });
 
     app.querySelectorAll("[data-caldate]").forEach(cell=>{
-      cell.addEventListener("click", ()=>{
-        state.dayDetail = cell.getAttribute("data-caldate");
-        render();
-      });
+      cell.addEventListener("click", ()=>{ state.dayDetail = cell.getAttribute("data-caldate"); render(); });
     });
 
     if (state.dayDetail) bindDayDetailHandlers();
@@ -724,10 +1027,15 @@
     });
   }
 
+  function closeSheetState(){
+    state.openSheet = null; state.draft = null; state.conflict = null;
+    state.saveError = ""; state.editingId = null; state.saving = false;
+  }
+
   function bindSheetHandlers(){
     const get = id => document.getElementById(id);
     const d = state.draft;
-    const closeAll = ()=>{ state.openSheet=null; state.draft=null; state.conflict=null; state.saveError=""; render(); };
+    const closeAll = ()=>{ closeSheetState(); render(); };
 
     get("closeSheet").addEventListener("click", closeAll);
     get("cancelForm").addEventListener("click", closeAll);
@@ -762,18 +1070,11 @@
     const deleteBtn = get("deleteBooking");
     if (deleteBtn) deleteBtn.addEventListener("click", async ()=>{
       if (!confirm("Delete this booking permanently? This can't be undone.")) return;
-      state.saving = true; render();
-      try{
-        state.bookings = await loadBookings();
-        state.bookings = state.bookings.filter(b=>b.id!==state.editingId);
-        await saveBookingsRemote(state.bookings);
-        saveSeenSnapshot(snapshotFromBookings(state.bookings));
-        state.saving = false;
-        state.openSheet=null; state.draft=null; render();
-      }catch(e){
-        state.saving = false; state.saveError = "Couldn't sync just now — " + (e && e.message ? e.message : "check your connection and try again.");
-        render();
-      }
+      const id = state.editingId;
+      state.queue.push({ type:"delete", id });
+      closeSheetState();
+      persistLocal(); recompute(); saveSeen(); render();
+      afterFlush(await flushQueue());
     });
   }
 
@@ -789,6 +1090,18 @@
     if (line) line.textContent = fmtMoney(pending);
   }
 
+  function afterFlush(ok){
+    if (ok){
+      state.syncStatus = "ok";
+      lastSig = sig();
+      render();
+    } else if (state.queue.length){
+      state.syncStatus = navigator.onLine ? "error" : "offline";
+      lastSig = sig();
+      pushToast("Saved on this phone. It will sync when the signal returns.", "new");
+    }
+  }
+
   async function handleSave(skipValidation){
     const d = state.draft;
     if (!skipValidation){
@@ -799,62 +1112,101 @@
 
     state.saving = true; state.saveError = ""; render();
 
+    // If there's signal, grab the newest bookings first so we catch a date someone else just took.
+    await tryPullRemote();
+
+    const conflict = d.cancelled ? null : findConflict(d.date, d.slot, state.editingId);
+    if (conflict){ state.conflict = conflict; state.saving = false; render(); return; }
+
+    let booking;
+    if (state.editingId){
+      const existing = state.bookings.find(b=>b.id===state.editingId) || {};
+      booking = Object.assign({}, existing, d, { updatedAt: Date.now() });
+    } else {
+      booking = Object.assign({}, d, { id: uid(), createdBy: state.myName || d.createdBy || "", updatedAt: Date.now() });
+    }
+
+    state.queue.push({ type:"upsert", booking });
+    closeSheetState();
+    persistLocal(); recompute(); saveSeen(); render();
+    afterFlush(await flushQueue());
+  }
+
+  // ---------- start up ----------
+
+  async function initialSync(){
+    const hadCache = lsHas(cacheKey(state.docId));
     try{
-      state.bookings = await loadBookings();
-
-      const conflict = d.cancelled ? null : findConflict(d.date, d.slot, state.editingId);
-      if (conflict){ state.conflict = conflict; state.saving = false; render(); return; }
-
-      if (state.editingId){
-        const idx = state.bookings.findIndex(b=>b.id===state.editingId);
-        const merged = Object.assign({}, state.bookings[idx]||{}, d, { updatedAt: Date.now() });
-        if (idx>=0) state.bookings[idx] = merged; else state.bookings.push(merged);
-      } else {
-        d.id = uid();
-        d.createdBy = state.myName || d.createdBy || "";
-        d.updatedAt = Date.now();
-        state.bookings.push(d);
-      }
-
-      await saveBookingsRemote(state.bookings);
-      saveSeenSnapshot(snapshotFromBookings(state.bookings));
-
-      state.saving = false; state.openSheet = null; state.draft = null; state.conflict = null; state.editingId = null;
-      render();
+      if (state.queue.length) await flushQueue();
+      const latest = await loadBookings();
+      state.remote = latest;
+      persistLocal();
+      recompute();
+      diffAndAnnounce(lsGet(seenKey(state.docId), null), state.bookings);
+      saveSeen();
+      state.syncStatus = "ok";
     }catch(e){
-      state.saving = false;
-      state.saveError = "Couldn't sync just now — " + (e && e.message ? e.message : "check your connection and try again.");
-      render();
+      if (e && e.notFound){
+        state.bootError = "This booking link wasn't found.";
+        state.bootErrorTech = "Check the link or booking ID with your team.";
+        return;
+      }
+      if (!hadCache){
+        state.bootError = "Load failed";
+        state.bootErrorTech = (e && e.message) ? e.message : "Unknown error";
+        return;
+      }
+      state.syncStatus = ((e && e.offline) || !navigator.onLine) ? "offline" : "error";
     }
   }
 
-  // ---------- boot ----------
+  function startLoops(){
+    if (loopsStarted) return;
+    loopsStarted = true;
+    setInterval(refresh, 6000);
+    document.addEventListener("visibilitychange", ()=>{ if (document.visibilityState==="visible") refresh(); });
+    window.addEventListener("online", ()=>{ refresh(); });
+    window.addEventListener("offline", ()=>{
+      state.syncStatus = "offline";
+      if (!state.openSheet && state.docId && !state.needsSetup && !state.bootError){ lastSig = sig(); render(); }
+    });
+  }
+
+  async function startWithDoc(id, initialRemote){
+    state.docId = id; state.needsSetup = false; state.bootError = ""; state.bootErrorTech = "";
+    lsSet(LAST_DOC_KEY, id);
+    try{
+      const u = new URL(window.location.href);
+      if (u.searchParams.get("doc") !== id){ u.searchParams.set("doc", id); window.history.replaceState({}, "", u.toString()); }
+    }catch(e){}
+    updateManifestLink();
+    if (initialRemote) lsSet(cacheKey(id), initialRemote);
+    state.remote = lsGet(cacheKey(id), []);
+    state.queue = lsGet(queueKey(id), []);
+    state.issues = lsGet(issuesKey(id), []);
+    recompute();
+    state.syncStatus = "loading";
+    render();                      // show the saved copy straight away, even with no signal
+    if (initialRemote){ saveSeen(); state.syncStatus = "ok"; }
+    else { await initialSync(); }
+    lastSig = sig();
+    render();
+    startLoops();
+  }
 
   async function boot(){
-    state.bootError = ""; state.bootErrorTech = ""; state.syncStatus = "loading";
+    state.bootError = ""; state.bootErrorTech = "";
     if (!state.calMonth) state.calMonth = startOfMonth(new Date());
-    render();
-    try{
-      state.docId = await ensureDoc();
-      state.bookings = await loadBookings();
-      diffAndAnnounce(loadSeenSnapshot(), state.bookings);
-      saveSeenSnapshot(snapshotFromBookings(state.bookings));
-      state.syncStatus = "ok";
-      render();
-
-      setInterval(()=>{ if (!state.openSheet) refresh(); }, 6000);
-      document.addEventListener("visibilitychange", ()=>{
-        if (document.visibilityState==="visible" && !state.openSheet) refresh();
-      });
-    }catch(e){
-      state.bootError = "Load failed";
-      state.bootErrorTech = e && e.message ? e.message : "Unknown error";
-      render();
-    }
+    state.myName = lsGet(NAME_KEY, "");
+    if (!booted){ booted = true; registerSW(); setupInstall(); }
+    const id = resolveDocId();
+    if (!id){ state.needsSetup = true; render(); return; }
+    await startWithDoc(id);
   }
 
   boot();
 })();
+
 </script>
 </body>
 </html>

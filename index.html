@@ -148,6 +148,18 @@
   .setup-or{ text-align:center; color:var(--muted); font-size:12.5px; margin:20px 0 12px; }
   .setup-note{ color:var(--muted); font-size:12px; line-height:1.5; margin-top:18px; }
   .linkbtn{ background:none !important; color:var(--ink-soft) !important; text-decoration:underline; padding:6px !important; margin-top:4px !important; }
+  .alert-card{ background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px; font-size:13.5px; line-height:1.5; color:var(--ink-soft); }
+  .alert-card b{ color:var(--ink); }
+  .alert-card p{ margin:6px 0 10px; }
+  .alert-card .small, .small{ font-size:12px; color:var(--muted); line-height:1.5; }
+  .alert-steps{ margin:6px 0 10px; padding-left:20px; }
+  .alert-steps li{ margin-bottom:4px; }
+  .alert-btn{ width:100%; padding:11px; font-size:14px; margin-top:6px; }
+  .topicbox{ display:flex; align-items:center; justify-content:space-between; gap:8px; background:var(--bg); border:1px solid var(--line); border-radius:9px; padding:8px 10px; margin-bottom:12px; }
+  .topicbox code{ font-size:12px; color:var(--ink); word-break:break-all; }
+  .topicbox button{ background:var(--ink); color:#fff; border:none; border-radius:7px; padding:6px 10px; font-size:12px; font-family:inherit; cursor:pointer; flex-shrink:0; }
+  .switch-row{ display:flex; align-items:flex-start; gap:10px; font-size:13.5px; color:var(--ink); margin:4px 0 8px; }
+  .switch-row input{ width:20px; height:20px; margin-top:1px; flex-shrink:0; accent-color:var(--gold); }
 </style>
 </head>
 <body>
@@ -165,6 +177,7 @@
   const LAST_DOC_KEY = "hb_last_doc";
   const NAME_KEY = "hb_my_name";
   const IOS_HINT_KEY = "hb_ios_hint_dismissed";
+  const PUSH_KEY = "hb_push_on";
   const cacheKey  = id => "hb_cache_"  + id;   // last bookings list seen from the server
   const queueKey  = id => "hb_queue_"  + id;   // changes made on this phone not yet synced
   const issuesKey = id => "hb_issues_" + id;   // changes that could not be synced (date taken)
@@ -199,7 +212,9 @@
     installEvt: null,
     installDismissed: false,
     showIosHint: false,
-    installed: false
+    installed: false,
+    alertsSheet: false,
+    pushOn: false
   };
   let toastCounter = 0;
   let booted = false;
@@ -299,10 +314,33 @@
   }
   function notifyOS(title, body){
     try{
-      if (typeof Notification!=="undefined" && Notification.permission==="granted"){
-        new Notification(title, { body });
-      }
+      if (state.pushOn) return;   // the ntfy app already alerts this phone
+      if (typeof Notification==="undefined" || Notification.permission!=="granted") return;
+      const opts = { body, icon:"icon-192.png", badge:"icon-192.png", tag:"hb-"+Date.now(), vibrate:[120,60,120] };
+      const fallback = ()=>{ try{ new Notification(title, opts); }catch(e){} };
+      if ("serviceWorker" in navigator){
+        navigator.serviceWorker.getRegistration().then(reg=>{
+          if (reg && reg.showNotification) return reg.showNotification(title, opts);
+          fallback();
+        }).catch(fallback);
+      } else { fallback(); }
     }catch(e){}
+  }
+
+  // ---------- team push alerts via ntfy.sh (works even when the app is closed) ----------
+
+  function pushTopic(){ return "hb-" + state.docId; }
+  function pushText(label, b){
+    return label + ": " + fmtDate(b.date) + " (" + (SLOT_LABEL[b.slot]||"Full day") + ")" + (b.createdBy ? " \u00B7 " + b.createdBy : "");
+  }
+  async function sendPush(title, message, force){
+    if ((!state.pushOn && !force) || !state.docId) return false;
+    try{
+      const url = "https://ntfy.sh/" + encodeURIComponent(pushTopic()) +
+        "?title=" + encodeURIComponent(title) + "&tags=calendar&click=" + encodeURIComponent(shareUrl());
+      const res = await fetch(url, { method:"POST", body: message });
+      return res.ok;
+    }catch(e){ return false; }
   }
   function snapshotFromBookings(list){
     const map = {};
@@ -421,6 +459,7 @@
       let merged = latest.slice();
       const sent = state.queue.slice();
       const rejected = [];
+      const announce = [];
       sent.forEach(op=>{
         if (op.type === "upsert"){
           const b = op.booking;
@@ -429,12 +468,16 @@
             if (clash){ rejected.push({ booking:b, clash }); return; }
           }
           const i = merged.findIndex(x=>x.id===b.id);
+          const wasActive = i>=0 && !merged[i].cancelled;
           if (i>=0) merged[i] = b; else merged.push(b);
+          if (op.isNew && !b.cancelled) announce.push({ title:"New booking", msg: pushText("New booking", b) });
+          else if (b.cancelled && wasActive) announce.push({ title:"Booking cancelled", msg: pushText("Booking cancelled", b) });
         } else if (op.type === "delete"){
           merged = merged.filter(x=>x.id!==op.id);
         }
       });
       await saveBookingsRemote(merged);
+      announce.forEach(a=>{ sendPush(a.title, a.msg); });
       state.remote = merged;
       state.queue = state.queue.filter(op=>!sent.includes(op));
       persistLocal();
@@ -465,7 +508,7 @@
   function sig(){ return JSON.stringify([state.bookings, state.syncStatus, state.queue.length, state.issues.length]); }
 
   async function refresh(){
-    if (state.openSheet || !state.docId || state.needsSetup || state.bootError) return;
+    if (state.openSheet || state.alertsSheet || !state.docId || state.needsSetup || state.bootError) return;
     if (refreshing) return;
     refreshing = true;
     try{
@@ -551,6 +594,7 @@
       <button class="fab" id="fabAdd" title="New booking"><span class="fab-plus">+</span> Add New Booking</button>
       ${state.dayDetail ? renderDayDetailSheet() : ""}
       ${state.openSheet ? renderSheet() : ""}
+      ${state.alertsSheet ? renderAlertsSheet() : ""}
     `;
     attachHandlers();
   }
@@ -659,11 +703,68 @@
 
   function shareUrl(){ return location.origin + location.pathname + "?doc=" + encodeURIComponent(state.docId); }
 
-  function alertsLabel(){
-    if (typeof Notification === "undefined") return "Alerts unsupported";
-    if (Notification.permission === "granted") return "\uD83D\uDD14 Alerts on";
-    if (Notification.permission === "denied") return "Alerts blocked";
-    return "Enable alerts";
+  function permGranted(){ return typeof Notification!=="undefined" && Notification.permission==="granted"; }
+  function alertsLabel(){ return (permGranted() || state.pushOn) ? "\uD83D\uDD14 Alerts on" : "Set up alerts"; }
+
+  function renderAlertsSheet(){
+    let permText, permBtn = "";
+    if (typeof Notification === "undefined"){ permText = "This browser can't show phone notifications. You'll still see banners inside the app."; }
+    else if (Notification.permission === "granted"){ permText = "On. You'll get a phone notification when someone else adds or cancels a booking while this app is open."; }
+    else if (Notification.permission === "denied"){ permText = "Blocked for this site. Allow notifications for this site in your phone's browser settings, then reload."; }
+    else { permText = "Off. Turn on to get phone notifications while this app is open."; permBtn = `<button class="ghost alert-btn" id="permBtn">Turn on phone notifications</button>`; }
+    return `
+      <div class="sheet-backdrop" id="alertsBackdrop">
+        <div class="sheet">
+          <button class="close-x" id="closeAlerts">&times;</button>
+          <h2 class="display">Alerts</h2>
+          <div class="alert-card">
+            <b>While the app is open</b>
+            <p>${permText}</p>
+            ${permBtn}
+          </div>
+          <div class="alert-card">
+            <b>Even when the app is closed</b>
+            <p>Every phone gets a notification for each booking added or cancelled by anyone, using the free <b>ntfy</b> app. On each phone:</p>
+            <ol class="alert-steps">
+              <li>Install <b>ntfy</b> from the Play Store or App Store.</li>
+              <li>Open it, tap <b>+</b>, and subscribe to this topic (keep the default server):</li>
+            </ol>
+            <div class="topicbox"><code>${escapeHtml(pushTopic())}</code><button id="copyTopic">Copy</button></div>
+            <label class="switch-row"><input type="checkbox" id="pushToggle" ${state.pushOn?"checked":""}/> <span>Send an alert to the team when I add or cancel a booking</span></label>
+            <p class="small">Turn this on for each phone that makes bookings. Only the date, slot and who added it are sent, never customer names, phone numbers or amounts. It goes through the public ntfy.sh service, and the topic name above acts as the password, so keep it private.</p>
+            <button class="ghost alert-btn" id="pushTest">Send a test notification</button>
+            <div class="small" id="pushResult"></div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function bindAlertsHandlers(){
+    const close = ()=>{ state.alertsSheet = false; render(); };
+    const x = document.getElementById("closeAlerts"); if (x) x.addEventListener("click", close);
+    const bd = document.getElementById("alertsBackdrop");
+    if (bd) bd.addEventListener("click", (e)=>{ if (e.target.id==="alertsBackdrop") close(); });
+    const perm = document.getElementById("permBtn");
+    if (perm) perm.addEventListener("click", async ()=>{
+      try{ await Notification.requestPermission(); }catch(e){}
+      render();
+    });
+    const copy = document.getElementById("copyTopic");
+    if (copy) copy.addEventListener("click", async ()=>{
+      try{ await navigator.clipboard.writeText(pushTopic()); copy.textContent = "Copied!"; setTimeout(()=>{ copy.textContent = "Copy"; }, 1500); }
+      catch(e){ prompt("Copy this topic:", pushTopic()); }
+    });
+    const tog = document.getElementById("pushToggle");
+    if (tog) tog.addEventListener("change", ()=>{ state.pushOn = tog.checked; lsSet(PUSH_KEY, state.pushOn); });
+    const test = document.getElementById("pushTest");
+    if (test) test.addEventListener("click", async ()=>{
+      const out = document.getElementById("pushResult");
+      if (out) out.textContent = "Sending...";
+      const ok = await sendPush("Test notification", "Alerts are working" + (state.myName ? " (sent by " + state.myName + ")" : "") + ".", true);
+      const out2 = document.getElementById("pushResult");
+      if (out2) out2.textContent = ok ? "Sent. It should appear in the ntfy app within a few seconds. If it doesn't, check you subscribed to the topic above." : "Couldn't send. Check your internet connection and try again.";
+    });
   }
 
   function statusLine(){
@@ -684,7 +785,7 @@
   }
 
   function renderTopbar(){
-    const notifOn = typeof Notification!=="undefined" && Notification.permission==="granted";
+    const notifOn = permGranted() || state.pushOn;
     return `
       <header class="topbar">
         <div class="title-row">
@@ -920,22 +1021,7 @@
     if (iosDismiss) iosDismiss.addEventListener("click", ()=>{ state.showIosHint = false; lsSet(IOS_HINT_KEY, true); render(); });
 
     const alertsBtn = document.getElementById("enableAlerts");
-    if (alertsBtn) alertsBtn.addEventListener("click", async ()=>{
-      if (typeof Notification === "undefined"){
-        alert("This browser doesn't support phone notifications. You'll still see in-app alerts while this page is open.");
-        return;
-      }
-      if (Notification.permission === "granted"){ pushToast("Alerts are already on.", "new"); return; }
-      if (Notification.permission === "denied"){
-        alert("Notifications are blocked for this site. Enable them in your browser/site settings, then reload the page.");
-        return;
-      }
-      try{
-        const result = await Notification.requestPermission();
-        render();
-        if (result === "granted") pushToast("Alerts enabled \u2014 you'll get notified of new and cancelled bookings while this page is open.", "restore");
-      }catch(e){}
-    });
+    if (alertsBtn) alertsBtn.addEventListener("click", ()=>{ state.alertsSheet = true; render(); });
 
     const copyBtn = document.getElementById("copyLink");
     if (copyBtn) copyBtn.addEventListener("click", async ()=>{
@@ -992,6 +1078,7 @@
 
     if (state.dayDetail) bindDayDetailHandlers();
     if (state.openSheet) bindSheetHandlers();
+    if (state.alertsSheet) bindAlertsHandlers();
   }
 
   function bindDayDetailHandlers(){
@@ -1126,9 +1213,11 @@
       booking = Object.assign({}, d, { id: uid(), createdBy: state.myName || d.createdBy || "", updatedAt: Date.now() });
     }
 
-    state.queue.push({ type:"upsert", booking });
+    const isNew = !state.editingId;
+    state.queue.push({ type:"upsert", booking, isNew });
     closeSheetState();
     persistLocal(); recompute(); saveSeen(); render();
+    if (isNew) pushToast("Booking added: " + (booking.customer||"New booking") + " \u2014 " + fmtDate(booking.date), "new");
     afterFlush(await flushQueue());
   }
 
@@ -1198,6 +1287,7 @@
     state.bootError = ""; state.bootErrorTech = "";
     if (!state.calMonth) state.calMonth = startOfMonth(new Date());
     state.myName = lsGet(NAME_KEY, "");
+    state.pushOn = lsGet(PUSH_KEY, false);
     if (!booted){ booted = true; registerSW(); setupInstall(); }
     const id = resolveDocId();
     if (!id){ state.needsSetup = true; render(); return; }

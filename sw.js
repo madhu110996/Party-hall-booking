@@ -1,6 +1,6 @@
 // Hall Bookings service worker: lets the app open with no signal.
 // Bump CACHE when you want phones to drop old cached files.
-const CACHE = "hall-bookings-v1";
+const CACHE = "hall-bookings-v2";
 const ASSETS = [
   "./index.html",
   "./manifest.webmanifest",
@@ -63,4 +63,15 @@ self.addEventListener("fetch", (event) => {
     }).catch(() => null);
     return cached || (await network) || new Response("", { status: 504 });
   })());
+});
+
+// Tapping a booking notification brings the app to the front (or opens it).
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+      for (const c of list) { if ("focus" in c) return c.focus(); }
+      if (self.clients.openWindow) return self.clients.openWindow("./");
+    })
+  );
 });
